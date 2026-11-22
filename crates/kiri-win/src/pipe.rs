@@ -298,8 +298,33 @@ fn build_sd() -> Option<*mut std::ffi::c_void> {
     (ok != 0 && !sd.is_null()).then_some(sd)
 }
 
+/// Converts a Windows SID pointer into its S-1-… string form.
+///
+/// # Safety
+/// `sid` must be null or point to a valid Windows SID.
+pub(crate) unsafe fn sid_to_string(sid: *mut std::ffi::c_void) -> Option<String> {
+    if sid.is_null() {
+        return None;
+    }
+    let mut str_ptr: windows_sys::core::PWSTR = ptr::null_mut();
+    // SAFETY: caller guarantees `sid` is a valid SID pointer; `str_ptr` is
+    // freed with `LocalFree` before returning.
+    unsafe {
+        if ConvertSidToStringSidW(sid, &mut str_ptr) == 0 || str_ptr.is_null() {
+            return None;
+        }
+        let mut n = 0;
+        while *str_ptr.add(n) != 0 {
+            n += 1;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(str_ptr, n));
+        LocalFree(str_ptr.cast());
+        Some(s)
+    }
+}
+
 /// The current process user's SID as an S-1-… string.
-fn current_user_sid() -> Option<String> {
+pub(crate) fn current_user_sid() -> Option<String> {
     // SAFETY: a sequence of token calls, each checked; buffers sized from the
     // first (length-query) call.
     unsafe {
@@ -320,16 +345,6 @@ fn current_user_sid() -> Option<String> {
             return None;
         }
         let user = &*(buf.as_ptr() as *const TOKEN_USER);
-        let mut str_ptr: windows_sys::core::PWSTR = ptr::null_mut();
-        if ConvertSidToStringSidW(user.User.Sid, &mut str_ptr) == 0 || str_ptr.is_null() {
-            return None;
-        }
-        let mut n = 0;
-        while *str_ptr.add(n) != 0 {
-            n += 1;
-        }
-        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(str_ptr, n));
-        LocalFree(str_ptr.cast());
-        Some(sid)
+        sid_to_string(user.User.Sid)
     }
 }
