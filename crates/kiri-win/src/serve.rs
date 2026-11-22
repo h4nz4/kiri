@@ -124,7 +124,7 @@ fn refuse(pipe: &Pipe, head: bool, message: &str) -> bool {
     }
     pipe.flush();
     let _ = pipe.write(&[]);
-    true
+    !pipe.is_aborted()
 }
 
 /// `refuse`, for a client whose request has not been read: read first, as
@@ -999,6 +999,16 @@ impl Bridge {
 
 }
 
+/// Flushes a server pipe before dropping the last `Arc<Pipe>` so handover's
+/// `Weak::upgrade()` can still reach the instance and cancel an in-flight flush.
+struct FlushOnDrop(Arc<Pipe>);
+
+impl Drop for FlushOnDrop {
+    fn drop(&mut self) {
+        self.0.flush();
+    }
+}
+
 /// One docker client: its requests go over the bridge, on this thread, and
 /// the replies come back on another.
 fn serve(hub: &Hub, pipe: Pipe) {
@@ -1006,6 +1016,8 @@ fn serve(hub: &Hub, pipe: Pipe) {
 }
 
 fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
+    let flush = FlushOnDrop(pipe);
+    let pipe = &flush.0;
     // A bridge can die between hub.bridge() and the insert below: while WSL
     // is still booting, wsl.exe exits at once. `replies` ends every
     // connection it finds when that happens, but one registered after that
@@ -1032,13 +1044,13 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
             Ok(b) => b,
             Err(e) => {
                 let answered = if e.kind() == io::ErrorKind::NotConnected {
-                    setup_pending() && refuse_new(&pipe, SETUP_UNFINISHED)
+                    setup_pending() && refuse_new(pipe, SETUP_UNFINISHED)
                 } else {
                     log(&format!("bridge: {e}"));
-                    refuse_new(&pipe, &message(Some(&format!("WSL did not start Kiri's Linux ({e})"))))
+                    refuse_new(pipe, &message(Some(&format!("WSL did not start Kiri's Linux ({e})"))))
                 };
                 if answered {
-                    linger(&pipe);
+                    linger(pipe);
                 }
                 return;
             }
@@ -1058,8 +1070,8 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
                 bridge.kill("it was started while WSL was not answering, and has said nothing");
                 continue;
             }
-            if refuse_new(&pipe, &message(Some(&why))) {
-                linger(&pipe);
+            if refuse_new(pipe, &message(Some(&why))) {
+                linger(pipe);
             }
             return;
         }
@@ -1084,8 +1096,8 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
                 }
                 *told = Some((Instant::now(), why.clone()));
                 drop(told);
-                if refuse_new(&pipe, &message(Some(&why))) {
-                    linger(&pipe);
+                if refuse_new(pipe, &message(Some(&why))) {
+                    linger(pipe);
                 }
                 return;
             }
@@ -1116,8 +1128,8 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
         bridge.conns.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
         if gave_up(dying_since.elapsed()) {
             log(&format!("bridge: kept stopping as soon as it started, for {} s; told the docker client", BRIDGE_WAIT.as_secs()));
-            if refuse_new(&pipe, &message(Some("Kiri's Linux in WSL kept stopping as the command came in"))) {
-                linger(&pipe);
+            if refuse_new(pipe, &message(Some("Kiri's Linux in WSL kept stopping as the command came in"))) {
+                linger(pipe);
             }
             return;
         }
@@ -1155,6 +1167,7 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
     };
     // Gone before a word: nothing for a refusal to wait for.
     request.set(false);
+    let end = if pipe.is_aborted() { CLOSE } else { end };
     if end == CLOSE {
         // Drop the reply channel before joining `writer`: a frozen or
         // credit-stalled bridge may never send CLOSE back, and no further
@@ -1163,18 +1176,41 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
             c.close();
         }
         pipe.cancel();
+    } else if !bridge.dead.load(Ordering::SeqCst) {
+        // Send EOF off the client thread so a full bridge input pipe cannot
+        // hold this instance open during a handover.
+        let b = bridge.clone();
+        let _ = thread::Builder::new().spawn(move || {
+            let _ = b.send(EOF, id, &[]);
+        });
     }
-    let _ = bridge.send(end, id, &[]);
     let replies_ended = writer.join().unwrap_or(false);
-    if end == EOF && replies_ended {
-        linger(&pipe);
+    let aborted = pipe.is_aborted();
+    if end == EOF && replies_ended && !aborted {
+        linger(pipe);
     }
-    if end != CLOSE
-        && let Some(c) = bridge.conns.lock().unwrap_or_else(PoisonError::into_inner).remove(&id)
-    {
-        c.close();
-    }
+    let removed = if end != CLOSE {
+        if let Some(c) = bridge.conns.lock().unwrap_or_else(PoisonError::into_inner).remove(&id) {
+            c.close();
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let send_close = end == CLOSE || ((aborted || !replies_ended) && removed);
+    // Flush (unless aborted) while the Arc is still reachable by `hang_up`,
+    // then close the pipe handle before notifying the bridge so a stalled
+    // bridge never blocks handover or delays `ActiveGuard`.
+    drop(flush);
     bridge.end_if_unused();
+    if send_close && !bridge.dead.load(Ordering::SeqCst) {
+        let b = bridge.clone();
+        let _ = thread::Builder::new().spawn(move || {
+            let _ = b.send(CLOSE, id, &[]);
+        });
+    }
 }
 
 /// Whether a connection whose bridge keeps dying as it starts has waited
@@ -1191,11 +1227,22 @@ fn gave_up(waited: Duration) -> bool {
 fn to_client(pipe: &Pipe, rx: &Receiver<Reply>, queued: &AtomicUsize, bridge: &Bridge, credit: Option<(u32, &Window)>, request: &Arrival) -> bool {
     let mut done = 0usize;
     let mut answered = false;
-    for reply in rx {
+    loop {
+        if pipe.is_aborted() {
+            break;
+        }
+        let reply = match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(reply) => reply,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if pipe.is_aborted() {
+            break;
+        }
         match reply {
             Reply::Data(d) => {
                 if pipe.write(&d).is_err() {
-                    return false;
+                    break;
                 }
                 if !answered {
                     bridge.told(None);
@@ -1204,17 +1251,18 @@ fn to_client(pipe: &Pipe, rx: &Receiver<Reply>, queued: &AtomicUsize, bridge: &B
                 queued.fetch_sub(d.len(), Ordering::SeqCst);
                 done += d.len();
                 if let Some((id, _)) = credit
-                    && done >= ACK_EVERY {
-                        let _ = bridge.send(ACK, id, &(done as u32).to_be_bytes());
-                        done = 0;
-                    }
+                    && done >= ACK_EVERY
+                {
+                    let _ = bridge.send(ACK, id, &(done as u32).to_be_bytes());
+                    done = 0;
+                }
             }
             // The docker CLI reads in byte mode, where the empty message
             // that is EOF reads as one only with no data queued ahead of
             // it; behind data it is merged away and the client waits on.
             Reply::Eof => {
                 pipe.flush();
-                return pipe.write(&[]).is_ok();
+                return !pipe.is_aborted() && pipe.write(&[]).is_ok();
             }
             // Closed before a word: the bridge could not reach the engine
             // (and says why), the daemon closed it unanswered (no reason),
@@ -1224,7 +1272,7 @@ fn to_client(pipe: &Pipe, rx: &Receiver<Reply>, queued: &AtomicUsize, bridge: &B
                 let message = message(why.as_deref());
                 if refuse(pipe, request.head(REQUEST_WAIT), &message) {
                     bridge.told(Some(&message));
-                    return true;
+                    return !pipe.is_aborted();
                 }
                 break;
             }
@@ -1777,6 +1825,308 @@ mod tests {
         server.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(2), "handover waited on bridge: {:?}", started.elapsed());
         drop((theirs, client));
+    }
+
+    /// A half-closed streaming client (write end closed via empty message,
+    /// e.g. `docker logs -f` or `docker run -i < NUL`) still releases the pipe
+    /// promptly on handover and notifies the bridge with CLOSE.
+    #[test]
+    fn hands_the_pipe_back_with_a_half_closed_streaming_client() {
+        let (output, mut out) = std::io::pipe().unwrap();
+        let (mut input, to_bridge) = std::io::pipe().unwrap();
+        let killed = Arc::new(AtomicBool::new(false));
+        let held = out.try_clone().unwrap();
+        let saw_eof = Arc::new(AtomicBool::new(false));
+        let saw_close = Arc::new(AtomicBool::new(false));
+        let (eof_flag, close_flag) = (saw_eof.clone(), saw_close.clone());
+        thread::spawn(move || {
+            let mut say = |kind, id, data: &[u8]| {
+                let _ = out.write_all(&header(kind, id, data.len()));
+                let _ = out.write_all(data);
+            };
+            say(ACK, 0, &[1]);
+            while let Ok(Some((kind, id, _))) = read_frame(&mut input) {
+                match kind {
+                    PING => say(PING, 0, &[]),
+                    DATA => {
+                        say(DATA, id, b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n");
+                    }
+                    EOF => {
+                        eof_flag.store(true, Ordering::SeqCst);
+                    }
+                    super::CLOSE => {
+                        close_flag.store(true, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let b = Bridge::over(Box::new(to_bridge), output, Box::new(Stub { killed, output: Some(held) }));
+        let (hub, _) = hub(move |_| b.clone());
+        let name = format!(r"\\.\pipe\kiri-test-handover-halfclose-{}", std::process::id());
+        let first = Pipe::create(&name, true).unwrap();
+        let other = Arc::new(AtomicBool::new(false));
+        let (h, n, o) = (hub.clone(), name.clone(), other.clone());
+        let server = thread::spawn(move || {
+            super::serve_while_free(
+                &n,
+                first,
+                move || o.load(Ordering::SeqCst).then_some("test engine"),
+                move |p| super::serve_shared(&h, p),
+            )
+        });
+        let client = Pipe::open(&name).unwrap();
+        client.write(b"GET /logs?follow=1 HTTP/1.1\r\nHost: kiri\r\n\r\n").unwrap();
+        // Half-close client write end (go-winio CloseWrite): reader exits with EOF.
+        client.write(&[]).unwrap();
+        let wait = Instant::now();
+        while !saw_eof.load(Ordering::SeqCst) {
+            assert!(wait.elapsed() < Duration::from_secs(5), "bridge did not see client EOF");
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(100));
+        other.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let theirs = loop {
+            match Pipe::create(&name, true) {
+                Ok(p) => break p,
+                Err(e) => {
+                    assert!(started.elapsed() < Duration::from_secs(1), "{name} still in use 1 s after handover: {e}");
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        server.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2), "handover took {:?}", started.elapsed());
+        let wait_close = Instant::now();
+        while !saw_close.load(Ordering::SeqCst) {
+            assert!(wait_close.elapsed() < Duration::from_secs(2), "bridge did not receive CLOSE for aborted half-closed client");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop((theirs, client));
+    }
+
+    /// A writer whose writes block whenever `gate` is set, standing in for a
+    /// bridge whose stdin pipe buffer is full.
+    struct BlockingWriter {
+        inner: std::io::PipeWriter,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let (lock, cv) = &*self.gate;
+            let mut blocked = lock.lock().unwrap();
+            while *blocked {
+                blocked = cv.wait(blocked).unwrap();
+            }
+            drop(blocked);
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// Handover releases the pipe and ActiveGuard without waiting on a bridge
+    /// whose stdin is blocked.
+    #[test]
+    fn hands_the_pipe_back_when_bridge_input_is_blocked() {
+        let (output, mut out) = std::io::pipe().unwrap();
+        let (mut input, to_bridge) = std::io::pipe().unwrap();
+        let killed = Arc::new(AtomicBool::new(false));
+        let held = out.try_clone().unwrap();
+        let saw_data = Arc::new(AtomicBool::new(false));
+        let data_flag = saw_data.clone();
+        thread::spawn(move || {
+            let mut say = |kind, id, data: &[u8]| {
+                let _ = out.write_all(&header(kind, id, data.len()));
+                let _ = out.write_all(data);
+            };
+            say(ACK, 0, &[1]);
+            while let Ok(Some((kind, id, _))) = read_frame(&mut input) {
+                match kind {
+                    PING => say(PING, 0, &[]),
+                    DATA => {
+                        say(DATA, id, b"HTTP/1.1 200 OK\r\n\r\n");
+                        data_flag.store(true, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let writer = BlockingWriter { inner: to_bridge, gate: gate.clone() };
+        let b = Bridge::over(Box::new(writer), output, Box::new(Stub { killed, output: Some(held) }));
+        let (hub, _) = hub(move |_| b.clone());
+        let name = format!(r"\\.\pipe\kiri-test-handover-blocked-bridge-{}", std::process::id());
+        let first = Pipe::create(&name, true).unwrap();
+        let other = Arc::new(AtomicBool::new(false));
+        let (h, n, o) = (hub.clone(), name.clone(), other.clone());
+        let server = thread::spawn(move || {
+            super::serve_while_free(
+                &n,
+                first,
+                move || o.load(Ordering::SeqCst).then_some("test engine"),
+                move |p| super::serve_shared(&h, p),
+            )
+        });
+        let client = Pipe::open(&name).unwrap();
+        client.write(b"GET /events HTTP/1.1\r\nHost: kiri\r\n\r\n").unwrap();
+        let wait = Instant::now();
+        while !saw_data.load(Ordering::SeqCst) {
+            assert!(wait.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Freeze bridge writes before handover triggers CLOSE.
+        *gate.0.lock().unwrap() = true;
+        other.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let theirs = loop {
+            match Pipe::create(&name, true) {
+                Ok(p) => break p,
+                Err(e) => {
+                    assert!(started.elapsed() < Duration::from_secs(1), "{name} still in use 1 s after handover with blocked bridge: {e}");
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        server.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2), "handover waited on blocked bridge: {:?}", started.elapsed());
+        // Release the blocked writer so the detached CLOSE sender can finish.
+        *gate.0.lock().unwrap() = false;
+        gate.1.notify_all();
+        drop((theirs, client));
+    }
+
+    /// Dropping a server `Pipe` does not block in `FlushFileBuffers` when a
+    /// client has not read what was written.
+    #[test]
+    fn pipe_drop_does_not_block_on_unread_data() {
+        let name = format!(r"\\.\pipe\kiri-test-drop-nonblock-{}", std::process::id());
+        let server = Pipe::create(&name, true).unwrap();
+        let client = Pipe::open(&name).unwrap();
+        server.connect().unwrap();
+        server.write(b"unread payload").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            drop(server);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(1)).expect("Pipe::drop blocked waiting for unread data");
+        drop(client);
+    }
+
+    /// When a client handler has finished its reply and is flushing unread data
+    /// to a stalled client, handover can still reach the `Arc<Pipe>` and cancel
+    /// the in-flight flush.
+    #[test]
+    fn hands_the_pipe_back_while_flushing_unread_reply() {
+        let (output, mut out) = std::io::pipe().unwrap();
+        let (mut input, to_bridge) = std::io::pipe().unwrap();
+        let killed = Arc::new(AtomicBool::new(false));
+        let held = out.try_clone().unwrap();
+        let sent_close = Arc::new(AtomicBool::new(false));
+        let sc = sent_close.clone();
+        thread::spawn(move || {
+            let mut say = |kind, id, data: &[u8]| {
+                let _ = out.write_all(&header(kind, id, data.len()));
+                let _ = out.write_all(data);
+            };
+            say(ACK, 0, &[1]);
+            while let Ok(Some((kind, id, _))) = read_frame(&mut input) {
+                match kind {
+                    PING => say(PING, 0, &[]),
+                    DATA => {
+                        // Send reply followed by CLOSE (not EOF): writer exits
+                        // immediately and handler enters FlushOnDrop while data
+                        // is still unread in the pipe buffer.
+                        say(DATA, id, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                        say(super::CLOSE, id, &[]);
+                        sc.store(true, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let b = Bridge::over(Box::new(to_bridge), output, Box::new(Stub { killed, output: Some(held) }));
+        let (hub, _) = hub(move |_| b.clone());
+        let name = format!(r"\\.\pipe\kiri-test-handover-flush-{}", std::process::id());
+        let first = Pipe::create(&name, true).unwrap();
+        let other = Arc::new(AtomicBool::new(false));
+        let (h, n, o) = (hub.clone(), name.clone(), other.clone());
+        let server = thread::spawn(move || {
+            super::serve_while_free(
+                &n,
+                first,
+                move || o.load(Ordering::SeqCst).then_some("test engine"),
+                move |p| super::serve_shared(&h, p),
+            )
+        });
+        let client = Pipe::open(&name).unwrap();
+        client.write(b"GET /info HTTP/1.1\r\nHost: kiri\r\n\r\n").unwrap();
+        let wait = Instant::now();
+        while !sent_close.load(Ordering::SeqCst) {
+            assert!(wait.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Let writer exit and serve_shared block inside FlushOnDrop::drop.
+        thread::sleep(Duration::from_millis(200));
+        other.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let theirs = loop {
+            match Pipe::create(&name, true) {
+                Ok(p) => break p,
+                Err(e) => {
+                    assert!(started.elapsed() < Duration::from_secs(1), "{name} still in use 1 s after handover during flush: {e}");
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        server.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2), "handover stalled in flush: {:?}", started.elapsed());
+        drop((theirs, client));
+    }
+
+    /// Without a handover, `FlushOnDrop` still flushes a reply followed by
+    /// CLOSE (no EOF) so a slightly slow client receives the full body.
+    #[test]
+    fn normal_reply_without_eof_flushes_before_close() {
+        let (output, mut out) = std::io::pipe().unwrap();
+        let (mut input, to_bridge) = std::io::pipe().unwrap();
+        let killed = Arc::new(AtomicBool::new(false));
+        let held = out.try_clone().unwrap();
+        thread::spawn(move || {
+            let mut say = |kind, id, data: &[u8]| {
+                let _ = out.write_all(&header(kind, id, data.len()));
+                let _ = out.write_all(data);
+            };
+            say(ACK, 0, &[1]);
+            while let Ok(Some((kind, id, _))) = read_frame(&mut input) {
+                if kind == DATA {
+                    say(DATA, id, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+                    say(super::CLOSE, id, &[]);
+                }
+            }
+        });
+        let b = Bridge::over(Box::new(to_bridge), output, Box::new(Stub { killed, output: Some(held) }));
+        let (hub, _) = hub(move |_| b.clone());
+        let name = format!(r"\\.\pipe\kiri-test-flush-deliver-{}", std::process::id());
+        let server = Pipe::create(&name, true).unwrap();
+        let h = hub.clone();
+        let srv = thread::spawn(move || {
+            server.connect().unwrap();
+            super::serve(&h, server);
+        });
+        let client = Pipe::open(&name).unwrap();
+        client.write(b"GET /info HTTP/1.1\r\nHost: kiri\r\n\r\n").unwrap();
+        // Pause so the server finishes writing and enters FlushOnDrop before we read.
+        thread::sleep(Duration::from_millis(100));
+        let mut reply = Vec::new();
+        let _ = (&client).read_to_end(&mut reply);
+        srv.join().unwrap();
+        assert_eq!(String::from_utf8_lossy(&reply), "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
     }
 
     /// New processes that cannot be opened (e.g. a SYSTEM service such as

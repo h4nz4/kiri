@@ -224,14 +224,11 @@ impl io::Write for &Pipe {
 
 impl Drop for Pipe {
     fn drop(&mut self) {
-        // SAFETY: the handle is ours and closed once. Flushing first lets the
-        // client read what was written before the pipe goes, unless the
-        // instance was aborted on handover.
+        // SAFETY: the handle is ours and closed once. Flushing is done by the
+        // caller while an `Arc<Pipe>` is still held so handover can cancel an
+        // in-flight flush via `abort()`; drop itself never blocks.
         unsafe {
             if self.server {
-                if !self.is_aborted() {
-                    FlushFileBuffers(self.h);
-                }
                 DisconnectNamedPipe(self.h);
             }
             CloseHandle(self.h);
