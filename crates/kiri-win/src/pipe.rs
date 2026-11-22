@@ -7,6 +7,7 @@
 
 use std::io;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
@@ -30,6 +31,8 @@ pub struct Pipe {
     h: HANDLE,
     /// The server's end (disconnected when dropped), not a client's.
     server: bool,
+    /// Abandoned on handover: stop new I/O and skip flushing on close.
+    aborted: AtomicBool,
 }
 
 // SAFETY: a pipe handle may be used from any thread; each overlapped call
@@ -69,7 +72,7 @@ impl Pipe {
             }
             return Err(e);
         }
-        Ok(Pipe { h, server: true })
+        Ok(Pipe { h, server: true, aborted: AtomicBool::new(false) })
     }
 
     /// A client connection to `name`, waiting while every instance is busy.
@@ -89,7 +92,7 @@ impl Pipe {
                 let mode = PIPE_READMODE_MESSAGE;
                 // SAFETY: our new handle and a valid mode.
                 unsafe { SetNamedPipeHandleState(h, &mode, ptr::null(), ptr::null()) };
-                return Ok(Pipe { h, server: false });
+                return Ok(Pipe { h, server: false, aborted: AtomicBool::new(false) });
             }
             // SAFETY: reads this thread's last error.
             if unsafe { GetLastError() } != ERROR_PIPE_BUSY {
@@ -107,8 +110,23 @@ impl Pipe {
         unsafe { CancelIoEx(self.h, ptr::null()) };
     }
 
+    /// Abandons this instance: cancels waiting I/O, stops new I/O, and
+    /// skips flushing unread replies when the handle is closed.
+    pub fn abort(&self) {
+        self.aborted.store(true, Ordering::SeqCst);
+        self.cancel();
+    }
+
+    /// Whether `abort` has been called on this instance.
+    pub fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::SeqCst)
+    }
+
     /// Whether the client is still connected, without reading.
     pub fn alive(&self) -> bool {
+        if self.is_aborted() {
+            return false;
+        }
         let mut avail = 0u32;
         // SAFETY: our handle; no buffer, only the count of bytes waiting.
         unsafe { PeekNamedPipe(self.h, ptr::null_mut(), 0, ptr::null_mut(), &mut avail, ptr::null_mut()) != 0 }
@@ -116,12 +134,18 @@ impl Pipe {
 
     /// Waits until the client has read everything written so far.
     pub fn flush(&self) {
+        if self.is_aborted() {
+            return;
+        }
         // SAFETY: our handle.
         unsafe { FlushFileBuffers(self.h) };
     }
 
     /// Waits for a client.
     pub fn connect(&self) -> io::Result<()> {
+        if self.is_aborted() {
+            return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
+        }
         // SAFETY: the OVERLAPPED outlives the call, which overlapped() waits on.
         match overlapped(self.h, |ov| unsafe { ConnectNamedPipe(self.h, ov) }) {
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32) => Ok(()),
@@ -136,6 +160,9 @@ impl Pipe {
 
     /// `read`, giving up (TimedOut) when nothing arrives within `timeout`.
     pub fn read_within(&self, buf: &mut [u8], timeout: Option<std::time::Duration>) -> io::Result<usize> {
+        if self.is_aborted() {
+            return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
+        }
         let len = buf.len().min(u32::MAX as usize) as u32;
         // SAFETY: buf is valid for len bytes until overlapped() returns.
         match overlapped_within(self.h, timeout, |ov| unsafe { ReadFile(self.h, buf.as_mut_ptr(), len, ptr::null_mut(), ov) }) {
@@ -149,6 +176,9 @@ impl Pipe {
     pub fn write(&self, data: &[u8]) -> io::Result<()> {
         let mut rest = data;
         loop {
+            if self.is_aborted() {
+                return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
+            }
             let len = rest.len().min(u32::MAX as usize) as u32;
             // SAFETY: rest is valid for len bytes until overlapped() returns.
             let n = overlapped(self.h, |ov| unsafe { WriteFile(self.h, rest.as_ptr(), len, ptr::null_mut(), ov) })? as usize;
@@ -195,10 +225,13 @@ impl io::Write for &Pipe {
 impl Drop for Pipe {
     fn drop(&mut self) {
         // SAFETY: the handle is ours and closed once. Flushing first lets the
-        // client read what was written before the pipe goes.
+        // client read what was written before the pipe goes, unless the
+        // instance was aborted on handover.
         unsafe {
             if self.server {
-                FlushFileBuffers(self.h);
+                if !self.is_aborted() {
+                    FlushFileBuffers(self.h);
+                }
                 DisconnectNamedPipe(self.h);
             }
             CloseHandle(self.h);
