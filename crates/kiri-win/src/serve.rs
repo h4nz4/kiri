@@ -352,7 +352,8 @@ fn k32_enum_pids(buf: &mut [u32]) -> Option<usize> {
 /// inspects only new PIDs (and checks creation times every 200 ms for PID
 /// reuse). Only processes under Program Files owned by this user, SYSTEM, or
 /// Administrators at medium integrity or above count; unreadable PIDs are
-/// verified per PID through SCM and WTS.
+/// verified per PID as SYSTEM services or Session 0 SYSTEM processes via SCM
+/// and WTS.
 #[derive(Default)]
 struct NewEngines {
     started: bool,
@@ -553,13 +554,9 @@ fn is_trusted_token(user_sid: &str, owner_sid: Option<&str>, integrity_rid: u32,
     user_sid.eq_ignore_ascii_case(SYSTEM_SID) || owner_sid.is_some_and(|o| o.eq_ignore_ascii_case(ADMINS_SID))
 }
 
-/// Whether a WTS entry's owner SID and session belong to SYSTEM (Session 0) or
-/// this user in the current session.
-fn is_trusted_wts_owner(user_sid: &str, session_id: u32, current_user_sid: Option<&str>, current_session_id: Option<u32>) -> bool {
-    if user_sid.eq_ignore_ascii_case(SYSTEM_SID) {
-        return session_id == 0;
-    }
-    current_user_sid.is_some_and(|me| user_sid.eq_ignore_ascii_case(me)) && current_session_id == Some(session_id)
+/// Whether a WTS entry's owner SID and session belong to SYSTEM in Session 0.
+fn is_trusted_wts_owner(user_sid: &str, session_id: u32) -> bool {
+    user_sid.eq_ignore_ascii_case(SYSTEM_SID) && session_id == 0
 }
 
 /// Reads a NUL-terminated UTF-16 string pointer, returning None when null.
@@ -610,17 +607,6 @@ fn program_files_dirs() -> &'static [String] {
 fn current_user_sid_cached() -> Option<&'static str> {
     static SID: OnceLock<Option<String>> = OnceLock::new();
     SID.get_or_init(crate::pipe::current_user_sid).as_deref()
-}
-
-fn current_session_id() -> Option<u32> {
-    static SESSION: OnceLock<Option<u32>> = OnceLock::new();
-    *SESSION.get_or_init(|| {
-        use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
-        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-        let mut session = 0u32;
-        // SAFETY: queries the current process's session ID into a local u32.
-        (unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } != 0).then_some(session)
-    })
 }
 
 /// Reads the creation time of an already-opened process handle as a 64-bit
@@ -767,6 +753,19 @@ unsafe fn check_process_token(h: windows_sys::Win32::Foundation::HANDLE) -> Toke
     }
 }
 
+/// Resolves the token check result for an opened Program Files engine process.
+/// When token access is denied, only a process verified as SYSTEM in Session 0
+/// matches; non-SYSTEM processes are treated as untrusted rather than routed to
+/// a filename-only fallback.
+fn resolve_engine_token(engine: &'static str, created: Option<u64>, trust: TokenTrust, is_system_session0: impl FnOnce() -> bool) -> ProcessInfo {
+    match trust {
+        TokenTrust::Trusted => ProcessInfo::Known { engine: Some(engine), created },
+        TokenTrust::Untrusted => ProcessInfo::Known { engine: None, created },
+        TokenTrust::Denied => ProcessInfo::Known { engine: is_system_session0().then_some(engine), created },
+        TokenTrust::Gone => ProcessInfo::Gone,
+    }
+}
+
 /// Inspects `pid`: checks Program Files path and, when the executable name
 /// matches `OTHER_ENGINES`, checks token owner and integrity level.
 fn inspect_process(pid: u32) -> ProcessInfo {
@@ -781,12 +780,10 @@ fn inspect_process(pid: u32) -> ProcessInfo {
         let created = handle_created_at(h);
         let info = match handle_image_path(h) {
             Ok(path) => match engine_at_path(&path, program_files_dirs()) {
-                Some(engine) => match check_process_token(h) {
-                    TokenTrust::Trusted => ProcessInfo::Known { engine: Some(engine), created },
-                    TokenTrust::Untrusted => ProcessInfo::Known { engine: None, created },
-                    TokenTrust::Denied => ProcessInfo::Denied,
-                    TokenTrust::Gone => ProcessInfo::Gone,
-                },
+                Some(engine) => resolve_engine_token(engine, created, check_process_token(h), || {
+                    let targets = HashSet::from([pid]);
+                    service_engine_for_pids(Some(&targets), None).is_some() || is_wts_system_session0(pid)
+                }),
                 None => ProcessInfo::Known { engine: None, created },
             },
             Err(err) if err == ERROR_ACCESS_DENIED => ProcessInfo::Denied,
@@ -899,44 +896,73 @@ fn service_engine_for_pids(target_pids: Option<&HashSet<u32>>, seen_services: Op
     }
 }
 
-/// Checks specific denied PIDs via WTS, requiring a verified non-null owner
-/// SID (SYSTEM in Session 0, or this user in the current session).
-fn wts_engine_for_pids(target_pids: &HashSet<u32>) -> Option<&'static str> {
+/// Enumerates WTS process entries across all sessions, passing them to `f`
+/// and freeing the returned buffer before returning.
+fn with_wts_processes<R>(f: impl FnOnce(&[windows_sys::Win32::System::RemoteDesktop::WTS_PROCESS_INFOW]) -> R) -> Option<R> {
     use windows_sys::Win32::System::RemoteDesktop::{WTSEnumerateProcessesExW, WTSFreeMemoryExW, WTSTypeProcessInfoLevel0, WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW};
     // WTS_ANY_SESSION = (DWORD)-2 in wtsapi32.h.
     const WTS_ANY_SESSION: u32 = u32::MAX - 1;
+    struct WtsMem(*mut std::ffi::c_void, u32);
+    impl Drop for WtsMem {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` was allocated by `WTSEnumerateProcessesExW` at level 0 with `self.1` entries.
+            unsafe { WTSFreeMemoryExW(WTSTypeProcessInfoLevel0, self.0, self.1) };
+        }
+    }
     let mut level = 0u32;
     let mut ptr: windows_sys::core::PWSTR = std::ptr::null_mut();
     let mut count = 0u32;
-    // SAFETY: queries level-0 process entries across all sessions and frees
-    // the returned block with `WTSFreeMemoryExW` before returning.
+    // SAFETY: queries level-0 process entries across all sessions and guards
+    // the returned block with `WtsMem` so it is freed on return or unwind.
     unsafe {
         if WTSEnumerateProcessesExW(WTS_CURRENT_SERVER_HANDLE, &mut level, WTS_ANY_SESSION, &mut ptr, &mut count) == 0 || ptr.is_null() {
             return None;
         }
+        let _guard = WtsMem(ptr.cast(), count);
         let entries = std::slice::from_raw_parts(ptr as *const WTS_PROCESS_INFOW, count as usize);
-        let me = current_user_sid_cached();
-        let sess = current_session_id();
-        let mut found = None;
+        Some(f(entries))
+    }
+}
+
+/// Checks whether `pid` belongs to SYSTEM in Session 0 via WTS.
+fn is_wts_system_session0(pid: u32) -> bool {
+    with_wts_processes(|entries| {
+        entries.iter().any(|e| {
+            if e.ProcessId != pid {
+                return false;
+            }
+            // SAFETY: `pUserSid` is null or a valid SID within the WTS buffer.
+            let Some(sid) = (unsafe { crate::pipe::sid_to_string(e.pUserSid) }) else { return false };
+            is_trusted_wts_owner(&sid, e.SessionId)
+        })
+    })
+    .unwrap_or(false)
+}
+
+/// Checks specific denied PIDs via WTS, requiring a verified non-null owner
+/// SID belonging to SYSTEM in Session 0.
+fn wts_engine_for_pids(target_pids: &HashSet<u32>) -> Option<&'static str> {
+    with_wts_processes(|entries| {
         for e in entries {
             if !target_pids.contains(&e.ProcessId) {
                 continue;
             }
-            let Some(name) = wide_to_string(e.pProcessName) else { continue };
+            // SAFETY: WTS entry pointers remain valid until `with_wts_processes` drops its guard.
+            let Some(name) = (unsafe { wide_to_string(e.pProcessName) }) else { continue };
             let Some(engine) = engine_named(&name) else { continue };
-            let Some(sid) = crate::pipe::sid_to_string(e.pUserSid) else { continue };
-            if is_trusted_wts_owner(&sid, e.SessionId, me, sess) {
-                found = Some(engine);
-                break;
+            // SAFETY: `pUserSid` is null or a valid SID within the WTS buffer.
+            let Some(sid) = (unsafe { crate::pipe::sid_to_string(e.pUserSid) }) else { continue };
+            if is_trusted_wts_owner(&sid, e.SessionId) {
+                return Some(engine);
             }
         }
-        WTSFreeMemoryExW(WTSTypeProcessInfoLevel0, ptr.cast(), count);
-        found
-    }
+        None
+    })
+    .flatten()
 }
 
 /// Verifies unreadable PIDs by checking those exact PIDs against active SYSTEM
-/// services under Program Files and against WTS owner SIDs.
+/// services under Program Files and against Session 0 SYSTEM processes via WTS.
 fn check_denied_pids(pids: &[u32]) -> Option<&'static str> {
     if pids.is_empty() {
         return None;
@@ -2829,13 +2855,13 @@ mod tests {
         assert!(!super::is_trusted_token("S-1-5-21-1-2-3-1000", Some("S-1-5-21-1-2-3-1000"), 0x0000, me));
         assert!(!super::is_trusted_token("S-1-5-19", Some("S-1-5-19"), 0x4000, me));
 
-        // WTS owner/session trust.
-        assert!(super::is_trusted_wts_owner(super::SYSTEM_SID, 0, me, Some(1)));
-        assert!(!super::is_trusted_wts_owner(super::SYSTEM_SID, 1, me, Some(1)));
-        assert!(super::is_trusted_wts_owner("S-1-5-21-1-2-3-1000", 1, me, Some(1)));
-        assert!(!super::is_trusted_wts_owner("S-1-5-21-1-2-3-1000", 2, me, Some(1)));
-        assert!(!super::is_trusted_wts_owner(other, 1, me, Some(1)));
-        assert!(!super::is_trusted_wts_owner(other, 2, me, Some(1)));
+        // WTS owner/session trust: only SYSTEM in Session 0.
+        assert!(super::is_trusted_wts_owner(super::SYSTEM_SID, 0));
+        assert!(!super::is_trusted_wts_owner(super::SYSTEM_SID, 1));
+        assert!(!super::is_trusted_wts_owner("S-1-5-21-1-2-3-1000", 0));
+        assert!(!super::is_trusted_wts_owner("S-1-5-21-1-2-3-1000", 1));
+        assert!(!super::is_trusted_wts_owner(other, 1));
+        assert!(!super::is_trusted_wts_owner(other, 2));
 
         // SCM service command-line and account parsing.
         assert_eq!(super::service_binary_path(r#""C:\Program Files\Docker\dockerd.exe" --run-service"#), Some(r"C:\Program Files\Docker\dockerd.exe"));
@@ -2849,7 +2875,58 @@ mod tests {
         // Live Windows queries succeed in this process.
         assert!(!super::program_files_dirs().is_empty());
         assert!(super::current_user_sid_cached().is_some());
-        assert!(super::current_session_id().is_some());
+    }
+
+    /// Unreadable same-user processes and non-SYSTEM processes with denied
+    /// token access never match through WTS filename fallback.
+    #[test]
+    fn unreadable_user_process_and_denied_token_do_not_match() {
+        let me = super::current_user_sid_cached().expect("current user SID");
+        assert!(!super::is_trusted_wts_owner(me, 0));
+        assert!(!super::is_trusted_wts_owner(me, 1));
+        assert!(!super::is_trusted_wts_owner(super::ADMINS_SID, 0));
+        assert!(!super::is_trusted_wts_owner("S-1-5-19", 0));
+        assert!(!super::is_trusted_wts_owner("S-1-5-20", 0));
+        assert!(super::is_trusted_wts_owner(super::SYSTEM_SID, 0));
+        assert!(!super::is_trusted_wts_owner(super::SYSTEM_SID, 1));
+        assert!(!super::is_wts_system_session0(std::process::id()));
+
+        // TokenTrust::Denied for a non-SYSTEM process is treated as untrusted
+        // rather than ProcessInfo::Denied (no routing to WTS fallback).
+        assert_eq!(
+            super::resolve_engine_token("Docker Desktop.exe", Some(42), super::TokenTrust::Denied, || false),
+            super::ProcessInfo::Known { engine: None, created: Some(42) },
+        );
+        assert_eq!(
+            super::resolve_engine_token("dockerd.exe", Some(42), super::TokenTrust::Denied, || true),
+            super::ProcessInfo::Known { engine: Some("dockerd.exe"), created: Some(42) },
+        );
+        assert_eq!(
+            super::resolve_engine_token("Docker Desktop.exe", Some(42), super::TokenTrust::Trusted, || unreachable!()),
+            super::ProcessInfo::Known { engine: Some("Docker Desktop.exe"), created: Some(42) },
+        );
+        assert_eq!(
+            super::resolve_engine_token("Docker Desktop.exe", Some(42), super::TokenTrust::Untrusted, || unreachable!()),
+            super::ProcessInfo::Known { engine: None, created: Some(42) },
+        );
+        assert_eq!(
+            super::resolve_engine_token("Docker Desktop.exe", Some(42), super::TokenTrust::Gone, || unreachable!()),
+            super::ProcessInfo::Gone,
+        );
+
+        // NewEngines does not route a non-SYSTEM denied-token process to check_denied.
+        let mut new = super::NewEngines::default();
+        let mut probe = MockProbe::new(vec![10]);
+        assert_eq!(new.find_with(&mut probe), None);
+        probe.pids = vec![10, 77];
+        probe.inspect = Box::new(|p| {
+            assert_eq!(p, 77);
+            super::resolve_engine_token("Docker Desktop.exe", Some(770), super::TokenTrust::Denied, || false)
+        });
+        probe.denied_result = Some("Docker Desktop.exe");
+        assert_eq!(new.find_with(&mut probe), None);
+        assert!(probe.denied_calls.is_empty());
+        assert_eq!(new.seen.get(&77), Some(&Some(770)));
     }
 
     /// Unreadable new PIDs are checked per PID via `check_denied` (owner check)
