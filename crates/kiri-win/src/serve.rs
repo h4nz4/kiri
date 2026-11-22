@@ -794,6 +794,43 @@ fn inspect_process(pid: u32) -> ProcessInfo {
     }
 }
 
+/// Outcome of one `EnumServicesStatusExW` call.
+enum ServiceEnumStep {
+    /// All active services fit in the buffer (`count` entries written).
+    Done(u32),
+    /// Buffer too small; `remaining` is `pcbBytesNeeded` for entries that did
+    /// not fit (only the remaining bytes when `cap > 0`).
+    MoreData { remaining: u32 },
+    /// Enumeration failed with an error other than `ERROR_MORE_DATA`.
+    Error,
+}
+
+/// Allocates and fills an aligned buffer via `EnumServicesStatusExW`, growing
+/// capacity by `cap + remaining` on `ERROR_MORE_DATA` so services added
+/// mid-enumeration do not shrink the buffer on retry.
+fn enum_services_with(mut call: impl FnMut(&mut [usize], u32) -> ServiceEnumStep) -> Option<(Vec<usize>, u32)> {
+    let mut size = match call(&mut [], 0) {
+        ServiceEnumStep::MoreData { remaining } if remaining > 0 => remaining as usize,
+        _ => return None,
+    };
+    let mut buf: Vec<usize> = Vec::new();
+    for _ in 0..4 {
+        let words = size.div_ceil(std::mem::size_of::<usize>());
+        let Ok(cap) = u32::try_from(words.saturating_mul(std::mem::size_of::<usize>())) else {
+            return None;
+        };
+        buf.resize(words, 0);
+        match call(&mut buf, cap) {
+            ServiceEnumStep::Done(count) => return (count > 0).then_some((buf, count)),
+            ServiceEnumStep::MoreData { remaining } if remaining > 0 => {
+                size = (cap as usize).saturating_add(remaining as usize);
+            }
+            ServiceEnumStep::MoreData { .. } | ServiceEnumStep::Error => return None,
+        }
+    }
+    None
+}
+
 /// Checks active Win32 services via the Service Control Manager, matching only
 /// `LocalSystem` services whose executable lies under Program Files and is in
 /// `OTHER_ENGINES`. When `target_pids` is `Some`, checks only those PIDs.
@@ -810,34 +847,22 @@ fn service_engine_for_pids(target_pids: Option<&HashSet<u32>>, seen_services: Op
         if scm == 0 {
             return None;
         }
-        let mut needed = 0u32;
-        let mut count = 0u32;
-        let mut resume = 0u32;
-        EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_ACTIVE, std::ptr::null_mut(), 0, &mut needed, &mut count, &mut resume, std::ptr::null());
-        if needed == 0 {
+        let Some((buf, count)) = enum_services_with(|buf, cap| {
+            let mut needed = 0u32;
+            let mut count = 0u32;
+            let mut resume = 0u32;
+            let ptr = if cap == 0 { std::ptr::null_mut() } else { buf.as_mut_ptr().cast() };
+            if EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_ACTIVE, ptr, cap, &mut needed, &mut count, &mut resume, std::ptr::null()) != 0 {
+                ServiceEnumStep::Done(count)
+            } else if GetLastError() == ERROR_MORE_DATA {
+                ServiceEnumStep::MoreData { remaining: needed }
+            } else {
+                ServiceEnumStep::Error
+            }
+        }) else {
             CloseServiceHandle(scm);
             return None;
-        }
-        let mut buf: Vec<usize> = Vec::new();
-        let mut ok = false;
-        for _ in 0..4 {
-            let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
-            buf.resize(words, 0);
-            let cap = (words * std::mem::size_of::<usize>()) as u32;
-            resume = 0;
-            count = 0;
-            if EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_ACTIVE, buf.as_mut_ptr().cast(), cap, &mut needed, &mut count, &mut resume, std::ptr::null()) != 0 {
-                ok = true;
-                break;
-            }
-            if GetLastError() != ERROR_MORE_DATA || needed == 0 {
-                break;
-            }
-        }
-        if !ok || count == 0 {
-            CloseServiceHandle(scm);
-            return None;
-        }
+        };
         let entries = std::slice::from_raw_parts(buf.as_ptr() as *const ENUM_SERVICE_STATUS_PROCESSW, count as usize);
         let mut next_seen = seen_services.is_some().then(HashSet::new);
         let mut found = None;
@@ -3070,5 +3095,68 @@ mod tests {
         }
         assert_eq!(found3, Some("dockerd.exe"));
         assert_eq!(probe3.service_calls, 1);
+    }
+
+    /// When a new service starts between the initial `EnumServicesStatusExW`
+    /// size query and the fill call, `pcbBytesNeeded` reports only the
+    /// remaining bytes that did not fit; retrying must grow the buffer by
+    /// `cap + remaining` rather than shrinking it to the remainder.
+    #[test]
+    fn enum_services_grows_buffer_on_more_data() {
+        // Initial query reports 4096 bytes; a new service starts before the
+        // first fill so total active services now need 4352 bytes (17 entries
+        // of 256 bytes). On a partial fill, EnumServicesStatusExW sets
+        // pcbBytesNeeded to only the unwritten remainder (total - written).
+        let entry_size = 256u32;
+        let mut caps = Vec::new();
+        let mut total = 4096u32;
+        let res = super::enum_services_with(|_buf, cap| {
+            caps.push(cap);
+            if cap == 0 {
+                let initial = total;
+                total = 4352;
+                return super::ServiceEnumStep::MoreData { remaining: initial };
+            }
+            if cap >= total {
+                return super::ServiceEnumStep::Done(total / entry_size);
+            }
+            let written = (cap / entry_size) * entry_size;
+            super::ServiceEnumStep::MoreData { remaining: total - written }
+        });
+        let (buf, count) = res.expect("enumeration should succeed after growing buffer");
+        assert_eq!(count, 17);
+        assert!(buf.len() * std::mem::size_of::<usize>() >= 4352);
+        assert_eq!(caps, vec![0, 4096, 4352]);
+
+        // Sequential growth across two mid-enumeration service starts also converges.
+        let mut caps2 = Vec::new();
+        let mut step = 0usize;
+        let res2 = super::enum_services_with(|_buf, cap| {
+            caps2.push(cap);
+            step += 1;
+            let total = match step {
+                1 => 1024u32,
+                2 => 1200u32,
+                _ => 1400u32,
+            };
+            if cap == 0 {
+                return super::ServiceEnumStep::MoreData { remaining: total };
+            }
+            if cap >= total {
+                return super::ServiceEnumStep::Done(5);
+            }
+            let written = (cap / 200) * 200;
+            super::ServiceEnumStep::MoreData { remaining: total - written }
+        });
+        assert_eq!(res2.map(|(_, c)| c), Some(5));
+        assert!(caps2.windows(2).all(|w| w[1] > w[0]), "buffer capacities did not grow: {caps2:?}");
+
+        // Non-ERROR_MORE_DATA failures and empty results return None cleanly.
+        assert!(super::enum_services_with(|_, _| super::ServiceEnumStep::Error).is_none());
+        assert!(super::enum_services_with(|_, cap| if cap == 0 { super::ServiceEnumStep::MoreData { remaining: 64 } } else { super::ServiceEnumStep::Done(0) }).is_none());
+
+        // Live SCM enumeration runs cleanly against the current PID (not a service).
+        let mine = std::collections::HashSet::from([std::process::id()]);
+        assert_eq!(super::service_engine_for_pids(Some(&mine), None), None);
     }
 }
